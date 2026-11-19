@@ -1,0 +1,187 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>金额换字 · 动效试映</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0;background:#f2f5ed;color:#18362e;font-family:"DM Sans","PingFang SC",system-ui,sans-serif}
+main{max-width:860px;margin:clamp(20px,7vh,72px) auto;padding:0 20px}
+header,.controls,nav,footer{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+header{justify-content:space-between;margin-bottom:20px}
+h1{font-size:clamp(22px,4vw,36px);letter-spacing:-.055em;margin:0}
+small,footer{font-size:13px;color:#496159}
+section{background:#123d35;color:#edfae8;overflow:hidden;border-radius:22px;box-shadow:0 10px 26px #163e3114}
+nav{padding:16px 18px;gap:4px}
+button,select{font:inherit;color:inherit;cursor:pointer;border:0}
+nav button{background:transparent;color:#d0e1d7;padding:8px 14px;border-radius:8px}
+nav button[aria-pressed=true]{background:#ceefd9;color:#124235;font-weight:650}
+button:focus-visible,select:focus-visible,a:focus-visible{outline:3px solid #d87d28;outline-offset:3px}
+canvas{display:block;width:100%;height:auto}
+.controls{padding:16px 20px;background:#0d302a;justify-content:space-between}
+.controls label{font-size:14px}.controls select{background:#19483c;color:white;padding:6px;border-radius:4px}
+.actions{display:flex;align-items:center;gap:14px}
+#play{border-radius:8px;background:#ffcf71;color:#34290e;font-weight:700;padding:9px 17px}
+input{accent-color:#ffcf71;vertical-align:middle}
+footer{margin:16px 2px;gap:15px}a{color:#215545}
+@media(max-width:470px){main{padding:0 10px}nav{padding:10px;gap:0}nav button{padding:7px 10px}.controls{padding:12px}.actions{gap:6px}footer{gap:8px}}
+</style>
+<main>
+<header><h1>金额换字 · 动效试映</h1><small>示例金额 ¥46.9997 → ¥47.0000</small></header>
+<section>
+<nav aria-label="选择动效"><button data-mode="slam" aria-pressed="true">重砸击飞</button><button data-mode="flip" aria-pressed="false">机械翻牌</button><button data-mode="roll" aria-pressed="false">滚轮进位</button></nav>
+<canvas id="stage" width="720" height="280" role="img" aria-label="重砸击飞，示例金额从46.9997元变为47.0000元"></canvas>
+<div class="controls"><label id="flight-control">击飞效果 <select id="flight"><option value="varied">随机力度 · 100 毫秒</option><option value="steep">A · 向上弹</option><option value="strong">B · 更有力</option><option value="original">上一版</option></select></label><label id="palette-control">浮空配色 <select id="palette"><option value="split">双色</option><option value="same">同色</option></select></label><label>播放速度 <select id="speed"><option value="1">正常</option><option value="0.4">慢动作 0.4×</option></select></label><div class="actions"><label><input type="checkbox" id="loop"> 循环</label><button id="play">↻ 重播</button></div></div>
+</section>
+<footer>动效参考 <a href="https://gsap.com/docs/v3/Plugins/Physics2DPlugin/">抛射轨迹 · GSAP</a><a href="https://pqina.nl/flip/preset-value-counter.html">翻牌 · Flip</a><a href="https://number-flow.barvian.me/">滚轮 · NumberFlow</a></footer>
+</main>
+<script>
+const stage=document.querySelector('#stage'), ctx=stage.getContext('2d');
+const ink='#d8ffe4', mint='#88ffcf', coral='#ff846b', old='¥46.9997', next='¥47.0000';
+const slots=[146,208,274,323,373,437,501,565], base=193;
+const duration=1180;
+let mode='slam',frame,repeat;
+const reduced=matchMedia('(prefers-reduced-motion: reduce)');
+const clamp=v=>Math.min(1,Math.max(0,v));
+function digit(c,x,y,{width=1,height=1,angle=0,alpha=1,tint=ink,lift=0}={}){
+  ctx.save();ctx.translate(x,y);ctx.rotate(angle);ctx.scale(width,height);
+  ctx.globalAlpha=clamp(alpha);ctx.fillStyle=ink;
+  if(lift>0){
+    const t=lift/(lift+14);
+    const strength=t*t*(3-2*t);
+    const blend=weight=>'color-mix(in srgb, '+tint+' '+(100*strength*weight)+'%, '+ink+')';
+    const gradient=ctx.createLinearGradient(0,-74,0,0);
+    gradient.addColorStop(0,blend(.62));gradient.addColorStop(1,blend(1));
+    ctx.fillStyle=gradient;
+  }
+  ctx.font='800 100px "Arial", sans-serif';
+  ctx.textAlign='center';ctx.fillText(c,0,0);ctx.restore();
+}
+const palette=document.querySelector('#palette');
+const flightPicker=document.querySelector('#flight');
+const profiles={
+  varied:{angle:30,gap:100},
+  steep:{angle:30,minSpeed:285,maxSpeed:315,gap:65},
+  strong:{angle:30,minSpeed:350,maxSpeed:385,gap:65},
+  original:{angle:62,minSpeed:230,maxSpeed:280,gap:130}
+};
+let flightSeeds=[];
+function drawFlightSeeds(){
+  const seeds=slots.map(()=>({direction:Math.random()*2-1,power:Math.random()}));
+  let lift=0;
+  places.forEach((i,rank)=>{
+    const r=seeds[i].power;
+    // Each higher place adds a random share of the headroom above the last.
+    lift=rank===0 ? 160+150*r : lift+(505-lift)*(.10+.30*r);
+    seeds[i].lift=lift;
+  });
+  return seeds;
+}
+function sampleFlight(i,profile){
+  const seed=flightSeeds[i];
+  const angle=seed.direction*profile.angle*Math.PI/180;
+  const weight=1-Math.pow(.73,places.indexOf(i));
+  const vertical=profile===profiles.varied
+    ? seed.lift
+    : (.65+.85*weight)*(profile.minSpeed+(profile.maxSpeed-profile.minSpeed)*seed.power)*Math.cos(angle);
+  return {horizontal:vertical*Math.tan(angle),vertical,
+          spin:(angle<0?-1:1)*(1.2+Math.abs(Math.sin(angle))*2.5)};
+}
+const places=Array.from(next,(_,i)=>i).reverse().filter(i=>/\d/.test(next[i]));
+const changed=places.filter(i=>old[i]!==next[i]);
+const settle=285;
+function impact(i,time){
+  const profile=profiles[flightPicker.value], slot=profile.gap, fall=slot*.86;
+  const x=slots[i], elapsed=time-120-changed.indexOf(i)*slot;
+  const weight=1-Math.pow(.73,places.indexOf(i));
+  if(elapsed<=0){digit(old[i],x,base);return}
+  if(elapsed>=fall+settle){digit(next[i],x,base);return}
+  const outgoing=palette.value==='split'?coral:mint;
+  if(elapsed<fall){
+    const u=elapsed/fall, y=base-(62+112*weight)*(1-Math.pow(u,1.6+weight));
+    digit(old[i],x,base);
+    if(u>0){digit(next[i],x,y,{height:1+.15*Math.sin(Math.PI*u)**2,alpha:clamp(u*3),tint:mint,lift:base-y})}
+    return;
+  }
+  const u=(elapsed-fall)/settle;
+  const squash=Math.sin(Math.PI*clamp(u/.23))*(.08+.19*weight);
+  const bounce=(3+3*weight)*Math.sin(Math.PI*clamp((u-.23)/.38))**2;
+  digit(next[i],x,base-bounce,{width:1+squash*.8,height:1-squash,tint:mint,lift:bounce});
+  if(u<.93){
+    // Outgoing glyph pivots around its centre as it follows a ballistic arc.
+    const flight=sampleFlight(i,profile);
+    const lift=flight.vertical*u*(1-u);
+    ctx.save();ctx.translate(x+flight.horizontal*u,base-35-lift);
+    ctx.rotate(flight.spin*(.25*u+.75*u*u));
+    digit(old[i],0,35,{tint:outgoing,lift,alpha:clamp((.91-u)/.38),width:1-.35*u,height:1-.35*u});
+    ctx.restore();
+  }
+}
+function flip(i,p){
+  const x=slots[i],hinge=base-36;
+  const fixed=(char,top)=>{
+    ctx.save();ctx.beginPath();ctx.rect(x-31,top?base-80:hinge,62,top?44:43);ctx.clip();
+    digit(char,x,base);ctx.restore();
+  };
+  fixed(next[i],true);fixed(old[i],false);
+  const top=p<.5,scale=Math.abs(Math.cos(Math.PI*p));
+  ctx.save();ctx.beginPath();ctx.rect(x-31,top?base-82:hinge,62,top?46:45);ctx.clip();
+  ctx.translate(x,hinge);ctx.scale(1,Math.max(.0001,scale));ctx.fillStyle='#163b34';
+  ctx.fillRect(-31,top?-45:0,62,45);digit(top?old[i]:next[i],0,36);
+  ctx.fillStyle='rgba(0,0,0,'+((1-scale)*.48)+')';ctx.fillRect(-31,top?-45:0,62,45);
+  ctx.restore();
+}
+function roll(i,p){
+  const x=slots[i],u=1-(1-p)**3,oldNumber=Number(old[i]),steps=(Number(next[i])-oldNumber+10)%10;
+  ctx.save();ctx.beginPath();ctx.rect(x-31,base-78,62,82);ctx.clip();
+  for(let j=0;j<=steps;j++)digit(String((oldNumber+j)%10),x,base+84*(j-u*steps));
+  ctx.restore();
+}
+function draw(kind,time){
+  const scale=stage.width/720;ctx.setTransform(scale,0,0,scale,0,0);
+  ctx.fillStyle='#123d35';ctx.fillRect(0,0,720,280);
+  ctx.strokeStyle='#396155';ctx.lineWidth=1;ctx.beginPath();ctx.moveTo(74,base+6.5);ctx.lineTo(651,base+6.5);ctx.stroke();
+  for(let i=0;i<old.length;i++){
+    const x=slots[i];
+    if(kind==='flip' && /\d/.test(old[i])){ctx.fillStyle='#163b34';ctx.fillRect(x-30,base-80,60,85)}
+    if(old[i]===next[i])digit(next[i],x,base);
+    else if(kind==='slam')impact(i,time);
+    else {
+      const delay=(old.length-1-i)*22, p=clamp((time-120-delay)/700);
+      if(p===1)digit(next[i],x,base);
+      else if(kind==='flip')flip(i,p);
+      else roll(i,p);
+    }
+    if(kind==='flip' && /\d/.test(old[i])){ctx.fillStyle='#092a27';ctx.fillRect(x-30,base-36,60,2)}
+  }
+}
+function stop(){cancelAnimationFrame(frame);clearTimeout(repeat)}
+function play(resample=true){
+  stop();
+  if(reduced.matches){draw(mode,duration);return}
+  if(mode==='slam' && (resample || !flightSeeds.length)){
+    flightSeeds=drawFlightSeeds();
+  }
+  const start=performance.now(), speed=Number(document.querySelector('#speed').value);
+  function paint(now){
+    const t=(now-start)*speed;
+    draw(mode,t);
+    if(t<duration)frame=requestAnimationFrame(paint);
+    else if(document.querySelector('#loop').checked)repeat=setTimeout(play,500);
+  }
+  frame=requestAnimationFrame(paint);
+}
+document.querySelectorAll('[data-mode]').forEach(button=>button.onclick=()=>{
+  mode=button.dataset.mode;
+  document.querySelector('#flight-control').hidden=mode!=='slam';
+  document.querySelector('#palette-control').hidden=mode!=='slam';
+  document.querySelectorAll('[data-mode]').forEach(b=>b.setAttribute('aria-pressed',String(b===button)));
+  stage.setAttribute('aria-label',button.textContent+'，示例金额从46.9997元变为47.0000元');
+  play();
+});
+flightPicker.onchange=()=>play(false);palette.onchange=()=>play(false);document.querySelector('#play').onclick=play;document.querySelector('#speed').onchange=play;
+document.querySelector('#loop').onchange=play;
+document.addEventListener('visibilitychange',()=>{if(document.hidden){stop();draw(mode,duration)}else if(document.querySelector('#loop').checked)play()});
+reduced.addEventListener('change',play);
+const ratio=Math.min(2,window.devicePixelRatio||1);stage.width=720*ratio;stage.height=280*ratio;play();
+</script>
+</html>

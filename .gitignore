@@ -1,0 +1,8 @@
+.DS_Store
+*.app/
+*.appex/
+*.p12
+*.mobileprovision
+.env
+week.json
+history.json
