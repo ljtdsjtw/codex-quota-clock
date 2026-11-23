@@ -1,6 +1,6 @@
 import Foundation
 
-struct QuotaWindow: Codable {
+struct QuotaWindow: Codable, Equatable {
     let usedPercent: Double
     let windowDurationMins: Int?
     let resetsAt: TimeInterval?
@@ -32,6 +32,10 @@ func durationText(_ seconds: Double) -> String {
     if hours >= 24 { return "\(hours / 24) 天 \(hours % 24) 小时" }
     return hours > 0 ? "\(hours) 小时 \(minutes % 60) 分" : "\(minutes) 分钟"
 }
+func refreshIntervalText(_ seconds: Int) -> String {
+    seconds < 60 ? "\(seconds) 秒" : "\(seconds / 60) 分钟"
+}
+
 func pct(_ fraction: Double) -> String {
     return (fraction * 100).formatted(.number.precision(.fractionLength(0...1))) + "%"
 }
@@ -55,8 +59,11 @@ enum Cost {
 struct WidgetData: Codable {
     let week: QuotaWindow?
     let synced: Date
-    let monthly: Double
+    var monthly: Double
     var planType: String? = nil
+    var otherWindow: QuotaWindow? = nil
+    var fromGuard: Bool? = nil
+    var sampleInterval: Int? = nil
 
     static func sharedFile(_ name: String) throws -> URL {
         guard let group = Bundle.main.object(forInfoDictionaryKey: "QuotaGroup") as? String,

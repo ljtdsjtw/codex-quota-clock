@@ -1,16 +1,21 @@
 import Foundation
 
-struct Limit: Decodable {
+struct Limit: Codable {
+    var limitId: String? = nil
     var planType: String? = nil
     let primary: QuotaWindow?
     let secondary: QuotaWindow?
     var windows: [QuotaWindow] { [primary, secondary].compactMap { $0 } }
 }
-struct Snapshot: Decodable {
+struct Snapshot: Codable {
     let accountId: String?
     let rateLimits: Limit
     let rateLimitsByLimitId: [String: Limit]?
-    var codexLimit: Limit { rateLimitsByLimitId?["codex"] ?? rateLimits }
+    var codexLimit: Limit {
+        if let codex = rateLimitsByLimitId?["codex"] { return codex }
+        if rateLimits.limitId == nil || rateLimits.limitId == "codex" { return rateLimits }
+        return Limit(primary: nil, secondary: nil)
+    }
     var windows: [QuotaWindow] { codexLimit.windows }
     var week: QuotaWindow? { windows.first { $0.windowDurationMins == 7 * 24 * 60 } }
 }
@@ -21,57 +26,100 @@ struct QuotaError: LocalizedError {
     var errorDescription: String? { message }
 }
 
-enum Reader {
-    static func read() throws -> Snapshot {
-        let bundled = ["ChatGPT", "Codex"].map {
-            "/Applications/\($0).app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex"
+// Access each reader on a single serial queue. Reuse the read-only connection between polls.
+final class Reader {
+    private var client: QuotaConnection?
+    private var authStamp: Date?
+    private var opened = Date.distantPast
+
+    func close() { client = nil }
+
+    func read() throws -> Snapshot {
+        let home = ProcessInfo.processInfo.environment["CODEX_HOME"] ??
+            FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".codex").path
+        let stamp = (try? FileManager.default.attributesOfItem(atPath: home + "/auth.json"))?[.modificationDate] as? Date
+        if authStamp != stamp || Date().timeIntervalSince(opened) >= 900 { close() }
+        if client == nil {
+            client = try QuotaConnection()
+            authStamp = stamp
+            opened = Date()
         }
-        let candidates = bundled + ["/Applications/Codex.app/Contents/Resources/codex",
-                                     "/opt/homebrew/bin/codex", "/usr/local/bin/codex"]
-        guard let executable = candidates.first(where: FileManager.default.isExecutableFile(atPath:)) else {
+        guard let client else { throw QuotaError("额度连接未建立。") }
+        do { return try client.sample() }
+        catch { close(); throw error }
+    }
+}
+
+private final class QuotaConnection {
+    private let process = Process()
+    private let input = Pipe()
+    private let output = Pipe()
+    private var sequence = 0
+    private var pending = Data()
+
+    init() throws {
+        let userApps = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Applications").path
+        var paths = [String]()
+        for directory in ["/Applications", userApps] {
+            for app in ["ChatGPT", "Codex"] {
+                let resources = "\(directory)/\(app).app/Contents/Resources"
+                paths += [resources + "/codex-cli/CodexCLI.app/Contents/MacOS/codex", resources + "/codex"]
+            }
+        }
+        paths += ["/opt/homebrew/bin/codex", "/usr/local/bin/codex"]
+        guard let executable = paths.first(where: FileManager.default.isExecutableFile(atPath:)) else {
             throw QuotaError("找不到 Codex，请检查 Mac 上的 Codex 安装。")
         }
-
-        let process = Process(), input = Pipe(), output = Pipe()
+        let info = ["name": "quota_clock", "title": "Codex 额度时钟", "version": "1.8"]
+        let marker = try JSONEncoder().encode(info)
         process.executableURL = URL(fileURLWithPath: executable)
-        process.arguments = ["app-server"]
+        process.arguments = ["app-server", "--stdio", "--startup-client-info", String(decoding: marker, as: UTF8.self)]
         process.standardInput = input
         process.standardOutput = output
         process.standardError = FileHandle.nullDevice
         try process.run()
-        let timeout = DispatchWorkItem { if process.isRunning { process.terminate() } }
-        DispatchQueue.global().asyncAfter(deadline: .now() + 22, execute: timeout)
-        defer {
-            timeout.cancel()
-            try? input.fileHandleForWriting.close()
+        _ = try request("initialize", params: ["clientInfo": info])
+        try send(["method": "initialized"])
+    }
+
+    deinit {
+        try? input.fileHandleForWriting.close()
+        if process.isRunning { process.terminate() }
+    }
+
+    func sample() throws -> Snapshot {
+        let result = try request("account/rateLimits/read", params: [:])
+        return try JSONDecoder().decode(Snapshot.self, from: JSONSerialization.data(withJSONObject: result))
+    }
+
+    private func send(_ message: [String: Any]) throws {
+        var data = try JSONSerialization.data(withJSONObject: message)
+        data.append(10)
+        try input.fileHandleForWriting.write(contentsOf: data)
+    }
+
+    private func request(_ method: String, params: [String: Any]) throws -> [String: Any] {
+        sequence += 1
+        let timeout = DispatchWorkItem { [process] in
             if process.isRunning { process.terminate() }
-            process.waitUntilExit()
         }
-        func send(_ message: [String: Any]) throws {
-            var data = try JSONSerialization.data(withJSONObject: message)
-            data.append(10)
-            try input.fileHandleForWriting.write(contentsOf: data)
-        }
-        try send(["id": 1, "method": "initialize", "params": ["clientInfo":
-                    ["name": "quota_clock", "title": "Codex 额度时钟", "version": "1.0"]]])
-        var pending = Data()
+        DispatchQueue.global().asyncAfter(deadline: .now() + 18, execute: timeout)
+        defer { timeout.cancel() }
+        try send(["id": sequence, "method": method, "params": params])
         while true {
-            let chunk = output.fileHandleForReading.availableData
-            guard !chunk.isEmpty else { throw QuotaError("读取中断或超时，请检查 Codex 登录和网络后重试。") }
-            pending.append(chunk)
             while let newline = pending.firstIndex(of: 10) {
                 let line = Data(pending[..<newline])
                 pending.removeSubrange(...newline)
-                guard let msg = try? JSONSerialization.jsonObject(with: line) as? [String: Any],
-                      let id = msg["id"] as? Int, id == 1 || id == 2 else { continue }
-                if msg["error"] != nil { throw QuotaError("Codex 未能返回额度，请检查登录状态和网络。") }
-                if id == 1 {
-                    try send(["method": "initialized"])
-                    try send(["id": 2, "method": "account/rateLimits/read", "params": [:]])
-                } else if let result = msg["result"] as? [String: Any] {
-                    return try JSONDecoder().decode(Snapshot.self, from: JSONSerialization.data(withJSONObject: result))
-                } else { throw QuotaError("Codex 返回了无法识别的额度数据。") }
+                guard let message = try? JSONSerialization.jsonObject(with: line) as? [String: Any],
+                      message["id"] as? Int == sequence else { continue }
+                guard let result = message["result"] as? [String: Any] else {
+                    throw QuotaError("Codex 读取失败，请检查登录状态和网络。")
+                }
+                return result
             }
+            let chunk = output.fileHandleForReading.availableData
+            guard !chunk.isEmpty else { throw QuotaError("读取中断或超时，请检查 Codex 登录和网络后重试。") }
+            pending.append(chunk)
         }
     }
 }

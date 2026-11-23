@@ -75,7 +75,11 @@ struct ClockFace: View {
                 }
                 if family == .systemMedium, let data = entry.snapshot {
                     Text(data.synced, format: .dateTime.month().day().hour().minute())
-                    Text("同步")
+                    if let seconds = data.sampleInterval {
+                        Text("同步 · 每 " + refreshIntervalText(seconds) + " 采样")
+                    } else {
+                        Text("同步")
+                    }
                 }
             }.font(.caption2)
             if let data = entry.snapshot, let p = data.week?.progress(at: entry.date) {

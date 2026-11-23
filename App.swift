@@ -64,13 +64,23 @@ struct MenuControls: View {
 }
 
 @main
+enum QuotaEntryPoint {
+    static func main() {
+        signal(SIGPIPE, SIG_IGN)
+        if CommandLine.arguments.dropFirst().first == "--quota-feed" {
+            QuotaFeed.run()
+        } else {
+            QuotaClock.main()
+        }
+    }
+}
+
 struct QuotaClock: App {
     @NSApplicationDelegateAdaptor(QuotaAppDelegate.self) private var delegate
     @AppStorage("showMenuBarQuota") private var showMenuBarQuota = true
     @AppStorage("showDesktopFee") private var showDesktopFee = true
     @StateObject private var model: Model
     init() {
-        signal(SIGPIPE, SIG_IGN)
         let source = Model()
         _model = StateObject(wrappedValue: source)
         source.start()

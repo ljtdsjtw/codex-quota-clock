@@ -11,17 +11,49 @@ final class Model: ObservableObject {
     @Published var now = Date()
     @Published var sharingProblem: String?
     @Published var history = WeekHistory.load()
-    @Published var historyProblem: String?
     @Published var onAC = Power.onAC
+    @Published private(set) var settings = GuardSettings()
+    @Published private(set) var serviceLoaded = false
+    @Published private(set) var legacyService = false
+    @Published private(set) var report: GuardReport?
+    @Published private(set) var applying = false
+    @Published var settingsProblem: String?
+    private let reader = Reader()
+    private let reads = DispatchQueue(label: "quota.sync", qos: .utility)
     private var powerSource: CFRunLoopSource?
-    var stale: Bool { updated.map { now.timeIntervalSince($0) >= staleAfter } ?? false }
-    private var lastAttempt = Date.distantPast
     private var timer: Timer?
-    func start() {
-        if let cached = WidgetData.load(), let week = cached.week {
-            snapshot = Snapshot(accountId: nil, rateLimits: Limit(planType: cached.planType, primary: week, secondary: nil), rateLimitsByLimitId: nil)
-            updated = cached.synced
+    private var pollTimer: Timer?
+    private var observer: NSObjectProtocol?
+    private var generation = 0
+    private var requestTime: Date?
+    private var lastServiceCheck = Date.distantPast
+    var stale: Bool { updated.map { now.timeIntervalSince($0) >= staleAfter } ?? false }
+    private var backgroundProvidesSamples: Bool { settings.enabled && serviceLoaded && !legacyService }
+
+    var protectionStatus: String {
+        if legacyService { return "旧版后台正在运行" }
+        if !settings.enabled { return "已关闭" }
+        guard serviceLoaded else { return "后台未运行" }
+        if report?.error != nil { return "读取异常" }
+        guard let checked = report?.checked_at,
+              abs(now.timeIntervalSince1970 - checked) <= Double(settings.interval * 2 + 30)
+        else { return "等待读数" }
+        switch report?.phase {
+        case "triggered": return "本周已触发"
+        case "stopping": return "正在断开"
+        default: return "低于 " + String(settings.threshold) + "% 时断开"
         }
+    }
+
+    private func restore(_ cached: WidgetData) {
+        snapshot = Snapshot(accountId: nil, rateLimits: Limit(planType: cached.planType,
+                            primary: cached.week, secondary: cached.otherWindow), rateLimitsByLimitId: nil)
+        updated = cached.synced
+        history = WeekHistory.load()
+    }
+
+    func start() {
+        if let cached = WidgetData.load() { restore(cached) }
         powerSource = IOPSCreateLimitedPowerNotification({ context in
             guard let context else { return }
             let model = Unmanaged<Model>.fromOpaque(context).takeUnretainedValue()
@@ -29,55 +61,132 @@ final class Model: ObservableObject {
             WidgetCenter.shared.reloadTimelines(ofKind: widgetKind)
         }, Unmanaged.passUnretained(self).toOpaque())?.takeRetainedValue()
         if let powerSource { CFRunLoopAddSource(CFRunLoopGetMain(), powerSource, .commonModes) }
-        refresh()
+        observer = DistributedNotificationCenter.default().addObserver(forName: QuotaArchive.notification,
+                              object: Bundle.main.bundleIdentifier, queue: .main) { [weak self] _ in
+            self?.readBackgroundSample()
+        }
+        reconcile(forceCheck: true, restart: true)
         timer = Timer.scheduledTimer(withTimeInterval: 10, repeats: true) { [weak self] _ in
             guard let self else { return }
             now = Date()
-            if now.timeIntervalSince(lastAttempt) >= 300 { refresh() }
+            guard !applying else { return }
+            reconcile()
+            readBackgroundSample()
         }
     }
+
     deinit {
         if let powerSource { CFRunLoopSourceInvalidate(powerSource) }
+        if let observer { DistributedNotificationCenter.default().removeObserver(observer) }
         timer?.invalidate()
+        pollTimer?.invalidate()
     }
+
+    func reconcile(forceCheck: Bool = false, restart: Bool = false) {
+        let disk = Protection.settings()
+        var policy = disk ?? GuardSettings()
+        let shouldInspect = forceCheck || policy != settings ||
+            ((settings.enabled || serviceLoaded) && Date().timeIntervalSince(lastServiceCheck) >= 60)
+        let loaded = shouldInspect ? Protection.isLoaded() : serviceLoaded
+        if shouldInspect { lastServiceCheck = Date() }
+        let legacy = loaded && disk?.enabled != true
+        if legacy { policy.enabled = true }
+        guard restart || policy != settings || loaded != serviceLoaded || legacy != legacyService else { return }
+        settings = policy
+        serviceLoaded = loaded
+        legacyService = legacy
+        generation += 1
+        fetching = false
+        requestTime = nil
+        pollTimer?.invalidate()
+        report = settings.enabled ? Protection.report() : nil
+        if backgroundProvidesSamples {
+            reads.async { [reader] in reader.close() }
+            readBackgroundSample()
+        } else {
+            refresh()
+            pollTimer = Timer.scheduledTimer(withTimeInterval: Double(policy.interval), repeats: true) { [weak self] _ in
+                self?.refresh()
+            }
+        }
+    }
+
+    private func readBackgroundSample() {
+        guard backgroundProvidesSamples else { return }
+        now = Date()
+        report = Protection.report()
+        if let cached = WidgetData.load(), cached.fromGuard == true, cached.synced != updated {
+            restore(cached)
+        }
+        problem = report?.error
+        sharingProblem = report?.display_error
+        if let requestTime {
+            let arrived = (updated ?? .distantPast) >= requestTime
+            if arrived || problem != nil || now.timeIntervalSince(requestTime) > 40 {
+                if !arrived && problem == nil { problem = "后台尚未返回新的读数。" }
+                fetching = false
+                self.requestTime = nil
+            }
+        }
+    }
+
     func refresh() {
-        guard !fetching else { return }
+        guard !fetching, !applying else { return }
         fetching = true
-        lastAttempt = Date()
-        DispatchQueue.global(qos: .utility).async {
-            let result = Result { try Reader.read() }
-            DispatchQueue.main.async {
-                self.fetching = false
-                self.now = Date()
+        if backgroundProvidesSamples {
+            requestTime = Date()
+            do { try Protection.requestSample() }
+            catch {
+                problem = "后台刷新失败：" + error.localizedDescription
+                requestTime = nil
+                fetching = false
+            }
+            return
+        }
+        let current = generation
+        reads.async { [weak self, reader] in
+            let result = Result { try reader.read() }
+            let date = Date()
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.generation == current else { return }
+                fetching = false
+                now = date
                 switch result {
                 case let .success(value):
-                    self.snapshot = value
-                    self.updated = self.now
-                    self.problem = nil
-                    if let week = value.week {
-                        do {
-                            try self.history.record(week: week, account: value.accountId, at: self.now)
-                            self.historyProblem = nil
-                        } catch { self.historyProblem = "用量历史暂时无法存盘。" }
-                    }
-                    self.publishWidget()
+                    snapshot = value
+                    updated = date
+                    problem = nil
+                    sharingProblem = QuotaArchive.publish(value, at: date, fromGuard: false)
+                    history = WeekHistory.load()
+                case .failure(let error): problem = error.localizedDescription
+                }
+            }
+        }
+    }
+
+    func apply(_ policy: GuardSettings, completion: @escaping (Bool) -> Void) {
+        guard !applying else { return }
+        applying = true
+        settingsProblem = nil
+        DispatchQueue.global(qos: .userInitiated).async {
+            let result = Result { try Protection.apply(policy) }
+            DispatchQueue.main.async {
+                self.applying = false
+                self.reconcile(forceCheck: true, restart: true)
+                switch result {
+                case .success: completion(true)
                 case .failure(let error):
-                    self.problem = error.localizedDescription
+                    self.settingsProblem = "保存失败：" + error.localizedDescription
+                    completion(false)
                 }
             }
         }
     }
 
     func publishWidget() {
-        guard let snapshot, let updated else { return }
         let monthly = (UserDefaults.standard.object(forKey: "monthlyCNY") as? Double) ?? Cost.defaultMonthly
-        do {
-            try WidgetData(week: snapshot.week, synced: updated, monthly: monthly, planType: snapshot.codexLimit.planType).save()
-            sharingProblem = nil
-            WidgetCenter.shared.reloadTimelines(ofKind: widgetKind)
-        } catch {
-            sharingProblem = "小组件数据同步失败。"
-        }
+        do { try QuotaArchive.updateMonthly(monthly); sharingProblem = nil }
+        catch { sharingProblem = "小组件数据同步失败。" }
     }
 }
 
@@ -113,6 +222,7 @@ struct Panel: View {
     @Binding var showMenuBarQuota: Bool
     @AppStorage("monthlyCNY") private var monthly = Cost.defaultMonthly
     @Binding var showDesktopFee: Bool
+    @State private var showProtection = false
     @State private var comparisonInfo = false
     @State private var editing = false
     @State private var draft = ""
@@ -139,6 +249,13 @@ struct Panel: View {
                 Image(systemName: "clock.badge.checkmark").foregroundStyle(teal)
                 Text("Codex 额度时钟").font(.system(size: 20, weight: .bold))
                 Spacer()
+                Button {
+                    model.reconcile(forceCheck: true)
+                    model.settingsProblem = nil
+                    showProtection = true
+                } label: {
+                    Label("保护与刷新", systemImage: "shield")
+                }
                 Button { model.refresh() } label: {
                     Label(model.fetching ? "读取中" : "刷新", systemImage: "arrow.clockwise")
                 }.disabled(model.fetching)
@@ -236,7 +353,6 @@ struct Panel: View {
                     }
                 }
             }
-            if let problem = model.historyProblem { Text(problem).foregroundStyle(brass) }
             if let problem = model.sharingProblem { Text(problem).foregroundStyle(brass) }
             if let problem = model.problem {
                 Text(problem + (model.updated != nil ? " 显示上次成功读取的数据。" : "")).font(.callout).foregroundStyle(brass)
@@ -248,14 +364,17 @@ struct Panel: View {
             }.toggleStyle(.switch).controlSize(.small)
             HStack {
                 Circle().fill(!model.stale && model.problem == nil && model.updated != nil ? teal : brass).frame(width: 6, height: 6)
-                Text(model.updated.map { "最近同步 " + dateText($0) } ?? "尚未同步")
+                Text(model.updated.map { "同步 " + $0.formatted(.dateTime.hour().minute().second()) } ?? "尚未同步")
                 Spacer()
-                Text("每 5 分钟自动刷新")
+                Text("每 " + refreshIntervalText(model.settings.interval) + " · 保护" + model.protectionStatus)
             }.font(.caption).foregroundStyle(.secondary)
         }
         .padding(22).frame(width: 485).foregroundStyle(ink).background(paper)
         .preferredColorScheme(.light)
         .onChange(of: monthly) { _, _ in model.publishWidget() }
+        .sheet(isPresented: $showProtection) {
+            ProtectionPanel(model: model, settings: model.settings)
+        }
         .sheet(isPresented: $editing) {
             VStack(alignment: .leading, spacing: 15) {
                 Text("每月实付订阅费").font(.headline)

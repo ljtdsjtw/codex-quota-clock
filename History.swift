@@ -37,13 +37,14 @@ struct WeekHistory: Codable {
     mutating func record(week: QuotaWindow, account: String?, at date: Date) throws {
         guard let end = week.resetsAt, let pace = week.progress(at: date) else { return }
         let key = account.map { SHA256.hash(data: Data($0.utf8)).map { String(format: "%02x", $0) }.joined() }
-        if reset != end || owner != key || (points.last.map { $0.fraction > pace.used || $0.date > date } ?? false) {
-            reset = end
+        let sameWindow = reset.map { abs($0 - end) < 300 } ?? false
+        if !sameWindow || owner != key || (points.last.map { $0.fraction > pace.used || $0.date > date } ?? false) {
             owner = key
             points.removeAll()
         }
+        reset = end
         let point = Observation(date: date, fraction: pace.used)
-        if let last = points.last, date.timeIntervalSince(last.date) < 60 {
+        if let last = points.last, floor(date.timeIntervalSince1970 / 60) == floor(last.date.timeIntervalSince1970 / 60) {
             points[points.count - 1] = point
         } else { points.append(point) }
         try JSONEncoder().encode(self).write(to: WidgetData.sharedFile("history.json"), options: .atomic)
